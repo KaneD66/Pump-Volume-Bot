@@ -1,9 +1,10 @@
 import { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import BN from 'bn.js';
-import { getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
+import { getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount, PumpSdk, OnlinePumpSdk } from '@pump-fun/pump-sdk';
 import { config } from './config.js';
 
 dotenv.config();
@@ -25,6 +26,7 @@ class PumpFunBot {
     
     // Initialize Pump SDK (will be loaded asynchronously)
     this.pumpSDK = null;
+    this.onlinePumpSDK = null;
     this._initializeSDK();
     
     console.log(`Bot initialized with wallet: ${this.wallet.publicKey.toString()}`);
@@ -36,24 +38,8 @@ class PumpFunBot {
    */
   async _initializeSDK() {
     try {
-      const pumpSDKModule = await import('@pump-fun/pump-sdk');
-      
-      // Use OnlinePumpSdk (for online operations) or PumpSdk
-      const PumpSDK = pumpSDKModule.OnlinePumpSdk || pumpSDKModule.PumpSdk;
-
-      if (!PumpSDK) {
-        throw new Error('PumpSdk or OnlinePumpSdk not found in SDK exports');
-      }
-
-      // OnlinePumpSdk only takes a Connection parameter
-      try {
-        this.pumpSDK = new PumpSDK(this.connection);
-        console.log('Pump SDK initialized successfully');
-      } catch (err) {
-        console.warn('Could not initialize Pump SDK. Some methods may not work.');
-        console.warn('Error:', err.message);
-        this.pumpSDK = null;
-      }
+      this.pumpSDK = new PumpSdk();
+      this.onlinePumpSDK = new OnlinePumpSdk(this.connection);
     } catch (error) {
       console.warn('Warning: Could not import pump SDK. Make sure @pump-fun/pump-sdk is installed.');
       console.warn('Error:', error.message);
@@ -78,15 +64,17 @@ class PumpFunBot {
    * @param {string} tokenMint - The mint address of the token to buy
    * @param {number} solAmount - Amount of SOL to spend (in SOL, not lamports)
    * @param {number} slippage - Slippage tolerance (default: 1%)
+   * @param {PublicKey} tokenProgram - Token program ID (default: TOKEN_PROGRAM_ID)
    * @returns {Promise<string>} Transaction signature
    */
-  async buy(tokenMint, solAmount, slippage = 1) {
+  async buy(tokenMint, solAmount, slippage = 1, tokenProgram = TOKEN_PROGRAM_ID) {
     await this._ensureSDK();
 
     try {
       console.log(`\n🟢 Buying token: ${tokenMint}`);
       console.log(`Amount: ${solAmount} SOL`);
       console.log(`Slippage: ${slippage}%`);
+      console.log(`Token Program: ${tokenProgram.toString()}`);
 
       // Check balance before purchase
       const balance = await this.connection.getBalance(this.wallet.publicKey);
@@ -103,14 +91,23 @@ class PumpFunBot {
 
       // Fetch required state
       console.log('Fetching global state...');
-      const global = await this.pumpSDK.fetchGlobal();
+      const global = await this.onlinePumpSDK.fetchGlobal();
+      
+      console.log('Fetching fee config...');
+      const feeConfig = await this.onlinePumpSDK.fetchFeeConfig();
       
       console.log('Fetching buy state...');
       const { bondingCurveAccountInfo, bondingCurve, associatedUserAccountInfo } =
-        await this.pumpSDK.fetchBuyState(mint, user);
+        await this.onlinePumpSDK.fetchBuyState(mint, user, tokenProgram);
 
       // Calculate token amount from SOL amount
-      const tokenAmount = getBuyTokenAmountFromSolAmount(global, bondingCurve, solAmountBN);
+      const tokenAmount = getBuyTokenAmountFromSolAmount({
+        global,
+        amount: solAmountBN,
+        bondingCurve,
+        feeConfig: feeConfig,
+        mintSupply: bondingCurve.realTokenReserves
+      });
       console.log(`Expected tokens: ${tokenAmount.toString()}`);
 
       // Get buy instructions
@@ -122,9 +119,10 @@ class PumpFunBot {
         associatedUserAccountInfo,
         mint,
         user,
-        solAmount: solAmountBN,
         amount: tokenAmount,
+        solAmount: solAmountBN,
         slippage: slippage,
+        tokenProgram: tokenProgram,
       });
 
       // Create and send transaction
@@ -152,15 +150,17 @@ class PumpFunBot {
    * @param {string} tokenMint - The mint address of the token to sell
    * @param {number} tokenAmount - Amount of tokens to sell (in token decimals)
    * @param {number} slippage - Slippage tolerance (default: 1%)
+   * @param {PublicKey} tokenProgram - Token program ID (default: TOKEN_PROGRAM_ID)
    * @returns {Promise<string>} Transaction signature
    */
-  async sell(tokenMint, tokenAmount, slippage = 1) {
+  async sell(tokenMint, tokenAmount, slippage = 1, tokenProgram = TOKEN_PROGRAM_ID) {
     await this._ensureSDK();
 
     try {
       console.log(`\n🔴 Selling token: ${tokenMint}`);
       console.log(`Amount: ${tokenAmount} tokens`);
       console.log(`Slippage: ${slippage}%`);
+      console.log(`Token Program: ${tokenProgram.toString()}`);
 
       const mint = new PublicKey(tokenMint);
       const user = this.wallet.publicKey;
@@ -168,10 +168,10 @@ class PumpFunBot {
 
       // Fetch required state
       console.log('Fetching global state...');
-      const global = await this.pumpSDK.fetchGlobal();
+      const global = await this.onlinePumpSDK.fetchGlobal();
       
       console.log('Fetching sell state...');
-      const { bondingCurveAccountInfo, bondingCurve } = await this.pumpSDK.fetchSellState(mint, user);
+      const { bondingCurveAccountInfo, bondingCurve } = await this.onlinePumpSDK.fetchSellState(mint, user, tokenProgram);
 
       // Calculate SOL amount from token amount
       const solAmountBN = getSellSolAmountFromTokenAmount(global, bondingCurve, tokenAmountBN);
@@ -188,6 +188,7 @@ class PumpFunBot {
         amount: tokenAmountBN,
         solAmount: solAmountBN,
         slippage: slippage,
+        tokenProgram: tokenProgram,
       });
 
       // Create and send transaction
@@ -221,9 +222,9 @@ class PumpFunBot {
       // Get token balance
       const tokenBalance = await this.getTokenBalance(tokenMint);
       
-      if (tokenBalance === 0) {
-        throw new Error('No tokens to sell');
-      }
+      // if (tokenBalance === 0) {
+      //   throw new Error('No tokens to sell');
+      // }
 
       console.log(`Selling all tokens: ${tokenBalance}`);
       return await this.sell(tokenMint, tokenBalance, slippage);
@@ -303,7 +304,7 @@ async function main() {
 
     // Example: Buy tokens
     // Uncomment and modify the token mint address to use
-    const tokenMint = '3E2z4KX7y457xJqK9RQeJhA29oPdoUvAAD3Ea3zQyuG3';
+    const tokenMint = '8mb5FoFwKtdPByA9mrjeDAXyz3aeiyBYcRquib4baaV4';
     await bot.buy(tokenMint, 0.001, 1); // Buy 0.001 SOL worth with 1% slippage
 
     // Example: Sell tokens
