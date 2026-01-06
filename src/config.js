@@ -19,5 +19,13 @@ export const config = {
   // Retry settings
   maxRetries: 3,
   retryDelay: 1000, // milliseconds
+  
+  // Volume bot settings
+  volumeBot: {
+    // Default delay between trades (milliseconds)
+    defaultDelayBetweenTrades: 2000,
+    // Safety limit for maximum cycles
+    maxCycles: 1000,
+  },
 };
 
