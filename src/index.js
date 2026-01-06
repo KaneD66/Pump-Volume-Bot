@@ -222,9 +222,9 @@ class PumpFunBot {
       // Get token balance
       const tokenBalance = await this.getTokenBalance(tokenMint);
       
-      // if (tokenBalance === 0) {
-      //   throw new Error('No tokens to sell');
-      // }
+      if (tokenBalance === 0) {
+        throw new Error('No tokens to sell');
+      }
 
       console.log(`Selling all tokens: ${tokenBalance}`);
       return await this.sell(tokenMint, tokenBalance, slippage);
@@ -232,7 +232,7 @@ class PumpFunBot {
       console.error(`❌ Sell all failed:`, error.message);
       throw error;
     }
-  }
+  } 
 
   /**
    * Get token balance for a specific token
