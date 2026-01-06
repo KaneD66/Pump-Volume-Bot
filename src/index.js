@@ -1,5 +1,5 @@
 import { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getMint } from '@solana/spl-token';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
@@ -60,17 +60,53 @@ class PumpFunBot {
   }
 
   /**
+   * Detect which token program a mint uses
+   * @param {PublicKey} mint - The mint address
+   * @returns {Promise<PublicKey>} The token program ID (TOKEN_PROGRAM_ID or TOKEN_2022_PROGRAM_ID)
+   */
+  async detectTokenProgram(mint) {
+    try {
+      const mintInfo = await this.connection.getAccountInfo(mint);
+      if (!mintInfo) {
+        throw new Error(`Mint account not found: ${mint.toString()}`);
+      }
+      
+      // Check which program owns the mint account
+      if (mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        return TOKEN_2022_PROGRAM_ID;
+      } else if (mintInfo.owner.equals(TOKEN_PROGRAM_ID)) {
+        return TOKEN_PROGRAM_ID;
+      } else {
+        // Default to TOKEN_PROGRAM_ID if unknown
+        console.warn(`Unknown token program owner: ${mintInfo.owner.toString()}. Defaulting to TOKEN_PROGRAM_ID`);
+        return TOKEN_PROGRAM_ID;
+      }
+    } catch (error) {
+      console.warn(`Error detecting token program: ${error.message}. Defaulting to TOKEN_PROGRAM_ID`);
+      return TOKEN_PROGRAM_ID;
+    }
+  }
+
+  /**
    * Buy tokens on pump.fun
    * @param {string} tokenMint - The mint address of the token to buy
    * @param {number} solAmount - Amount of SOL to spend (in SOL, not lamports)
    * @param {number} slippage - Slippage tolerance (default: 1%)
-   * @param {PublicKey} tokenProgram - Token program ID (default: TOKEN_PROGRAM_ID)
+   * @param {PublicKey} tokenProgram - Token program ID (optional, will be auto-detected if not provided)
    * @returns {Promise<string>} Transaction signature
    */
-  async buy(tokenMint, solAmount, slippage = 1, tokenProgram = TOKEN_PROGRAM_ID) {
+  async buy(tokenMint, solAmount, slippage = 1, tokenProgram = null) {
     await this._ensureSDK();
 
     try {
+      const mint = new PublicKey(tokenMint);
+      
+      // Auto-detect token program if not provided
+      if (!tokenProgram) {
+        console.log('Detecting token program...');
+        tokenProgram = await this.detectTokenProgram(mint);
+      }
+
       console.log(`\n🟢 Buying token: ${tokenMint}`);
       console.log(`Amount: ${solAmount} SOL`);
       console.log(`Slippage: ${slippage}%`);
@@ -85,7 +121,6 @@ class PumpFunBot {
         throw new Error(`Insufficient balance. Need ${solAmount} SOL, have ${solBalance.toFixed(4)} SOL`);
       }
 
-      const mint = new PublicKey(tokenMint);
       const user = this.wallet.publicKey;
       const solAmountBN = new BN(solAmount * 1e9); // Convert to lamports
 
@@ -150,31 +185,47 @@ class PumpFunBot {
    * @param {string} tokenMint - The mint address of the token to sell
    * @param {number} tokenAmount - Amount of tokens to sell (in token decimals)
    * @param {number} slippage - Slippage tolerance (default: 1%)
-   * @param {PublicKey} tokenProgram - Token program ID (default: TOKEN_PROGRAM_ID)
+   * @param {PublicKey} tokenProgram - Token program ID (optional, will be auto-detected if not provided)
    * @returns {Promise<string>} Transaction signature
    */
-  async sell(tokenMint, tokenAmount, slippage = 1, tokenProgram = TOKEN_PROGRAM_ID) {
+  async sell(tokenMint, tokenAmount, slippage = 1, tokenProgram = null) {
     await this._ensureSDK();
 
     try {
+      const mint = new PublicKey(tokenMint);
+      
+      // Auto-detect token program if not provided
+      if (!tokenProgram) {
+        console.log('Detecting token program...');
+        tokenProgram = await this.detectTokenProgram(mint);
+      }
+      const mintInfo = await getMint(this.connection, mint, 'confirmed', tokenProgram);
       console.log(`\n🔴 Selling token: ${tokenMint}`);
       console.log(`Amount: ${tokenAmount} tokens`);
       console.log(`Slippage: ${slippage}%`);
       console.log(`Token Program: ${tokenProgram.toString()}`);
 
-      const mint = new PublicKey(tokenMint);
       const user = this.wallet.publicKey;
-      const tokenAmountBN = new BN(tokenAmount);
-
+      const tokenAmountBN = new BN(tokenAmount * 10 ** mintInfo.decimals);
+      console.log('Token amount:', tokenAmountBN.toString());
       // Fetch required state
       console.log('Fetching global state...');
       const global = await this.onlinePumpSDK.fetchGlobal();
+      
+      console.log('Fetching fee config...');
+      const feeConfig = await this.onlinePumpSDK.fetchFeeConfig();
       
       console.log('Fetching sell state...');
       const { bondingCurveAccountInfo, bondingCurve } = await this.onlinePumpSDK.fetchSellState(mint, user, tokenProgram);
 
       // Calculate SOL amount from token amount
-      const solAmountBN = getSellSolAmountFromTokenAmount(global, bondingCurve, tokenAmountBN);
+      const solAmountBN = getSellSolAmountFromTokenAmount({
+        global,
+        feeConfig: feeConfig,
+        mintSupply: bondingCurve.realTokenReserves,
+        bondingCurve,
+        amount: tokenAmountBN,
+      });
       console.log(`Expected SOL: ${(solAmountBN.toNumber() / 1e9).toFixed(6)} SOL`);
 
       // Get sell instructions
@@ -305,13 +356,13 @@ async function main() {
     // Example: Buy tokens
     // Uncomment and modify the token mint address to use
     const tokenMint = '8mb5FoFwKtdPByA9mrjeDAXyz3aeiyBYcRquib4baaV4';
-    await bot.buy(tokenMint, 0.001, 1); // Buy 0.001 SOL worth with 1% slippage
+    // await bot.buy(tokenMint, 0.001, 1); // Buy 0.001 SOL worth with 1% slippage
 
     // Example: Sell tokens
     // await bot.sell(tokenMint, 1000, 1); // Sell 1000 tokens with 1% slippage
 
     // Example: Sell all tokens
-    await bot.sellAll(tokenMint, 1);
+    // await bot.sellAll(tokenMint, 1);
 
   } catch (error) {
     console.error('Bot error:', error);
