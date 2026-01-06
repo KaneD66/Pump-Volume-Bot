@@ -1,6 +1,9 @@
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import BN from 'bn.js';
+import { getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
 import { config } from './config.js';
 
 dotenv.config();
@@ -35,29 +38,21 @@ class PumpFunBot {
     try {
       const pumpSDKModule = await import('@pump-fun/pump-sdk');
       
-      // Try different possible export names
-      const PumpSDK = pumpSDKModule.PumpFun || 
-                      pumpSDKModule.PumpDotFunSDK || 
-                      pumpSDKModule.default ||
-                      pumpSDKModule;
+      // Use OnlinePumpSdk (for online operations) or PumpSdk
+      const PumpSDK = pumpSDKModule.OnlinePumpSdk || pumpSDKModule.PumpSdk;
 
-      // Try object-based initialization first
+      if (!PumpSDK) {
+        throw new Error('PumpSdk or OnlinePumpSdk not found in SDK exports');
+      }
+
+      // OnlinePumpSdk only takes a Connection parameter
       try {
-        this.pumpSDK = new PumpSDK({
-          connection: this.connection,
-          wallet: this.wallet,
-        });
+        this.pumpSDK = new PumpSDK(this.connection);
         console.log('Pump SDK initialized successfully');
-      } catch (error) {
-        // Fallback to positional arguments if object-based fails
-        try {
-          this.pumpSDK = new PumpSDK(this.connection, this.wallet);
-          console.log('Pump SDK initialized successfully (positional args)');
-        } catch (err) {
-          console.warn('Could not initialize Pump SDK. Some methods may not work.');
-          console.warn('Error:', err.message);
-          this.pumpSDK = null;
-        }
+      } catch (err) {
+        console.warn('Could not initialize Pump SDK. Some methods may not work.');
+        console.warn('Error:', err.message);
+        this.pumpSDK = null;
       }
     } catch (error) {
       console.warn('Warning: Could not import pump SDK. Make sure @pump-fun/pump-sdk is installed.');
@@ -102,30 +97,44 @@ class PumpFunBot {
         throw new Error(`Insufficient balance. Need ${solAmount} SOL, have ${solBalance.toFixed(4)} SOL`);
       }
 
-      // Execute buy transaction using pump SDK
-      // Note: The SDK method signature may vary. Adjust based on actual SDK documentation
-      // Common patterns:
-      // - buy({ mint, amount, slippage })
-      // - buy(mint, amount, slippage)
-      // - buyToken({ mint, solAmount, slippage })
-      let result;
-      try {
-        result = await this.pumpSDK.buy({
-          mint: new PublicKey(tokenMint),
-          amount: solAmount,
-          slippage: slippage,
-        });
-      } catch (err) {
-        // Try alternative method signature
-        result = await this.pumpSDK.buy(
-          new PublicKey(tokenMint),
-          solAmount,
-          slippage
-        );
-      }
+      const mint = new PublicKey(tokenMint);
+      const user = this.wallet.publicKey;
+      const solAmountBN = new BN(solAmount * 1e9); // Convert to lamports
 
-      // Handle different result formats
-      const signature = result.signature || result.txid || result;
+      // Fetch required state
+      console.log('Fetching global state...');
+      const global = await this.pumpSDK.fetchGlobal();
+      
+      console.log('Fetching buy state...');
+      const { bondingCurveAccountInfo, bondingCurve, associatedUserAccountInfo } =
+        await this.pumpSDK.fetchBuyState(mint, user);
+
+      // Calculate token amount from SOL amount
+      const tokenAmount = getBuyTokenAmountFromSolAmount(global, bondingCurve, solAmountBN);
+      console.log(`Expected tokens: ${tokenAmount.toString()}`);
+
+      // Get buy instructions
+      console.log('Building buy instructions...');
+      const instructions = await this.pumpSDK.buyInstructions({
+        global,
+        bondingCurveAccountInfo,
+        bondingCurve,
+        associatedUserAccountInfo,
+        mint,
+        user,
+        solAmount: solAmountBN,
+        amount: tokenAmount,
+        slippage: slippage,
+      });
+
+      // Create and send transaction
+      const transaction = new Transaction().add(...instructions);
+      const signature = await sendAndConfirmTransaction(
+        this.connection,
+        transaction,
+        [this.wallet],
+        { commitment: 'confirmed' }
+      );
       
       console.log(`✅ Buy successful!`);
       console.log(`Transaction signature: ${signature}`);
@@ -153,26 +162,42 @@ class PumpFunBot {
       console.log(`Amount: ${tokenAmount} tokens`);
       console.log(`Slippage: ${slippage}%`);
 
-      // Execute sell transaction using pump SDK
-      // Note: The SDK method signature may vary. Adjust based on actual SDK documentation
-      let result;
-      try {
-        result = await this.pumpSDK.sell({
-          mint: new PublicKey(tokenMint),
-          amount: tokenAmount,
-          slippage: slippage,
-        });
-      } catch (err) {
-        // Try alternative method signature
-        result = await this.pumpSDK.sell(
-          new PublicKey(tokenMint),
-          tokenAmount,
-          slippage
-        );
-      }
+      const mint = new PublicKey(tokenMint);
+      const user = this.wallet.publicKey;
+      const tokenAmountBN = new BN(tokenAmount);
 
-      // Handle different result formats
-      const signature = result.signature || result.txid || result;
+      // Fetch required state
+      console.log('Fetching global state...');
+      const global = await this.pumpSDK.fetchGlobal();
+      
+      console.log('Fetching sell state...');
+      const { bondingCurveAccountInfo, bondingCurve } = await this.pumpSDK.fetchSellState(mint, user);
+
+      // Calculate SOL amount from token amount
+      const solAmountBN = getSellSolAmountFromTokenAmount(global, bondingCurve, tokenAmountBN);
+      console.log(`Expected SOL: ${(solAmountBN.toNumber() / 1e9).toFixed(6)} SOL`);
+
+      // Get sell instructions
+      console.log('Building sell instructions...');
+      const instructions = await this.pumpSDK.sellInstructions({
+        global,
+        bondingCurveAccountInfo,
+        bondingCurve,
+        mint,
+        user,
+        amount: tokenAmountBN,
+        solAmount: solAmountBN,
+        slippage: slippage,
+      });
+
+      // Create and send transaction
+      const transaction = new Transaction().add(...instructions);
+      const signature = await sendAndConfirmTransaction(
+        this.connection,
+        transaction,
+        [this.wallet],
+        { commitment: 'confirmed' }
+      );
       
       console.log(`✅ Sell successful!`);
       console.log(`Transaction signature: ${signature}`);
@@ -278,14 +303,14 @@ async function main() {
 
     // Example: Buy tokens
     // Uncomment and modify the token mint address to use
-    // const tokenMint = 'YOUR_TOKEN_MINT_ADDRESS_HERE';
-    // await bot.buy(tokenMint, 0.1, 1); // Buy 0.1 SOL worth with 1% slippage
+    const tokenMint = '3E2z4KX7y457xJqK9RQeJhA29oPdoUvAAD3Ea3zQyuG3';
+    await bot.buy(tokenMint, 0.001, 1); // Buy 0.001 SOL worth with 1% slippage
 
     // Example: Sell tokens
     // await bot.sell(tokenMint, 1000, 1); // Sell 1000 tokens with 1% slippage
 
     // Example: Sell all tokens
-    // await bot.sellAll(tokenMint, 1);
+    await bot.sellAll(tokenMint, 1);
 
   } catch (error) {
     console.error('Bot error:', error);
@@ -294,7 +319,8 @@ async function main() {
 }
 
 // Run if this file is executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+const __filename = fileURLToPath(import.meta.url);
+if (process.argv[1] === __filename || process.argv[1].replace(/\\/g, '/') === __filename.replace(/\\/g, '/')) {
   main();
 }
 
