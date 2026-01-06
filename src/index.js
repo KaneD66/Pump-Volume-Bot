@@ -263,29 +263,6 @@ class PumpFunBot {
   }
 
   /**
-   * Sell all tokens of a specific type
-   * @param {string} tokenMint - The mint address of the token to sell
-   * @param {number} slippage - Slippage tolerance (default: 1%)
-   * @returns {Promise<string>} Transaction signature
-   */
-  async sellAll(tokenMint, slippage = 1) {
-    try {
-      // Get token balance
-      const tokenBalance = await this.getTokenBalance(tokenMint);
-      
-      if (tokenBalance === 0) {
-        throw new Error('No tokens to sell');
-      }
-
-      console.log(`Selling all tokens: ${tokenBalance}`);
-      return await this.sell(tokenMint, tokenBalance, slippage);
-    } catch (error) {
-      console.error(`❌ Sell all failed:`, error.message);
-      throw error;
-    }
-  } 
-
-  /**
    * Get token balance for a specific token
    * @param {string} tokenMint - The mint address of the token
    * @returns {Promise<number>} Token balance
@@ -325,21 +302,168 @@ class PumpFunBot {
   }
 
   /**
-   * Monitor wallet balance and token holdings
+   * Generate volume by buying and selling tokens repeatedly
+   * @param {string} tokenMint - The mint address of the token to trade
+   * @param {number} volumeTarget - Target volume in SOL (e.g., 10 SOL)
+   * @param {number} perTransactionAmount - Amount of SOL per transaction (e.g., 0.1 SOL)
+   * @param {number} slippage - Slippage tolerance (default: 1%)
+   * @param {number} delayBetweenTrades - Delay in milliseconds between trades (default: 2000ms)
+   * @returns {Promise<Object>} Summary of volume generation
    */
-  async getWalletInfo() {
+  async generateVolume(tokenMint, volumeTarget, perTransactionAmount, slippage = 1, delayBetweenTrades = 2000) {
+    await this._ensureSDK();
+
+    let totalVolumeGenerated = 0;
+    let transactionCount = 0;
+    let buyCount = 0;
+    let sellCount = 0;
+    const startTime = Date.now();
+    const errors = [];
+
+    // Helper function to sleep
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
     try {
-      const solBalance = await this.getSolBalance();
-      console.log(`\n📊 Wallet Info:`);
-      console.log(`Address: ${this.wallet.publicKey.toString()}`);
-      console.log(`SOL Balance: ${solBalance.toFixed(4)} SOL`);
-      
+      // Check initial balance
+      const initialBalance = await this.getSolBalance();
+      console.log(`\n💰 Initial SOL Balance: ${initialBalance.toFixed(4)} SOL`);
+
+      // Calculate how many transactions we'll need (each cycle = buy + sell = 2x perTransactionAmount volume)
+      // But we'll track actual volume generated
+      const estimatedCycles = Math.ceil(volumeTarget / (perTransactionAmount * 2));
+      console.log(`Estimated cycles needed: ~${estimatedCycles} (buy + sell pairs)`);
+
+      while (totalVolumeGenerated < volumeTarget) {
+        try {
+          // Check if we have enough balance
+          const currentBalance = await this.getSolBalance();
+          if (currentBalance < perTransactionAmount * 1.1) { // Need extra for fees
+            console.warn(`⚠️ Insufficient balance. Current: ${currentBalance.toFixed(4)} SOL, Need: ${(perTransactionAmount * 1.1).toFixed(4)} SOL`);
+            break;
+          }
+
+          transactionCount++;
+          console.log(`\n📈 Cycle ${transactionCount} - Target Volume: ${volumeTarget} SOL, Generated: ${totalVolumeGenerated.toFixed(4)} SOL`);
+
+          // BUY
+          console.log(`\n🟢 [${transactionCount}.1] BUYING ${perTransactionAmount} SOL worth...`);
+          try {
+            const buySignature = await this.buy(tokenMint, perTransactionAmount, slippage);
+            buyCount++;
+            totalVolumeGenerated += perTransactionAmount;
+            console.log(`✅ Buy successful! Volume generated: ${totalVolumeGenerated.toFixed(4)}/${volumeTarget} SOL`);
+            
+            // Wait before selling
+            if (delayBetweenTrades > 0) {
+              await sleep(delayBetweenTrades);
+            }
+          } catch (buyError) {
+            console.error(`❌ Buy failed in cycle ${transactionCount}:`, buyError.message);
+            errors.push({ cycle: transactionCount, type: 'buy', error: buyError.message });
+            // Continue to next cycle even if buy fails
+            if (delayBetweenTrades > 0) {
+              await sleep(delayBetweenTrades);
+            }
+            continue;
+          }
+
+          // Check if we've reached the target after buy
+          if (totalVolumeGenerated >= volumeTarget) {
+            console.log(`\n🎯 Volume target reached after buy!`);
+            break;
+          }
+
+          // SELL
+          console.log(`\n🔴 [${transactionCount}.2] SELLING tokens...`);
+          try {
+            // Get current token balance
+            const tokenBalance = await this.getTokenBalance(tokenMint);
+            
+            if (tokenBalance > 0) {
+              const sellSignature = await this.sell(tokenMint, tokenBalance, slippage);
+              sellCount++;
+              
+              // Estimate SOL received (approximate, actual may vary)
+              // We'll track the buy amount as volume since sell volume is harder to track precisely
+              // But we can add an estimate
+              totalVolumeGenerated += perTransactionAmount; // Approximate sell volume
+              console.log(`✅ Sell successful! Volume generated: ${totalVolumeGenerated.toFixed(4)}/${volumeTarget} SOL`);
+            } else {
+              console.warn(`⚠️ No tokens to sell after buy`);
+            }
+          } catch (sellError) {
+            console.error(`❌ Sell failed in cycle ${transactionCount}:`, sellError.message);
+            errors.push({ cycle: transactionCount, type: 'sell', error: sellError.message });
+            // Continue even if sell fails - we'll try to sell in next cycle
+          }
+
+          // Wait before next cycle
+          if (delayBetweenTrades > 0 && totalVolumeGenerated < volumeTarget) {
+            await sleep(delayBetweenTrades);
+          }
+
+        } catch (cycleError) {
+          console.error(`❌ Error in cycle ${transactionCount}:`, cycleError.message);
+          errors.push({ cycle: transactionCount, type: 'cycle', error: cycleError.message });
+          
+          // Wait before retrying
+          if (delayBetweenTrades > 0) {
+            await sleep(delayBetweenTrades);
+          }
+        }
+
+        // Safety check: if we've done too many cycles without progress, break
+        if (transactionCount > 1000) {
+          console.warn(`⚠️ Safety limit reached (1000 cycles). Stopping.`);
+          break;
+        }
+      }
+
+      const endTime = Date.now();
+      const duration = ((endTime - startTime) / 1000).toFixed(2);
+      const finalBalance = await this.getSolBalance();
+
+      // Summary
+      console.log(`\n\n📊 Volume Generation Summary:`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`Target Volume: ${volumeTarget} SOL`);
+      console.log(`Generated Volume: ${totalVolumeGenerated.toFixed(4)} SOL`);
+      console.log(`Progress: ${((totalVolumeGenerated / volumeTarget) * 100).toFixed(2)}%`);
+      console.log(`Total Cycles: ${transactionCount}`);
+      console.log(`Successful Buys: ${buyCount}`);
+      console.log(`Successful Sells: ${sellCount}`);
+      console.log(`Errors: ${errors.length}`);
+      console.log(`Duration: ${duration} seconds`);
+      console.log(`Initial Balance: ${initialBalance.toFixed(4)} SOL`);
+      console.log(`Final Balance: ${finalBalance.toFixed(4)} SOL`);
+      console.log(`Balance Change: ${(finalBalance - initialBalance).toFixed(4)} SOL`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+      if (errors.length > 0) {
+        console.log(`\n⚠️ Errors encountered:`);
+        errors.forEach((err, idx) => {
+          console.log(`  ${idx + 1}. Cycle ${err.cycle} (${err.type}): ${err.error}`);
+        });
+      }
+
       return {
-        address: this.wallet.publicKey.toString(),
-        solBalance: solBalance
+        success: totalVolumeGenerated >= volumeTarget * 0.95, // 95% success threshold
+        targetVolume: volumeTarget,
+        generatedVolume: totalVolumeGenerated,
+        progress: (totalVolumeGenerated / volumeTarget) * 100,
+        transactionCount,
+        buyCount,
+        sellCount,
+        errors: errors.length,
+        duration: parseFloat(duration),
+        initialBalance,
+        finalBalance,
+        balanceChange: finalBalance - initialBalance,
+        errorDetails: errors
       };
+
     } catch (error) {
-      console.error(`Error getting wallet info:`, error.message);
+      console.error(`❌ Volume generation failed:`, error.message);
       throw error;
     }
   }
@@ -349,20 +473,21 @@ class PumpFunBot {
 async function main() {
   try {
     const bot = new PumpFunBot();
-    
-    // Display wallet info
-    await bot.getWalletInfo();
 
-    // Example: Buy tokens
-    // Uncomment and modify the token mint address to use
     const tokenMint = '8mb5FoFwKtdPByA9mrjeDAXyz3aeiyBYcRquib4baaV4';
-    // await bot.buy(tokenMint, 0.001, 1); // Buy 0.001 SOL worth with 1% slippage
-
-    // Example: Sell tokens
-    // await bot.sell(tokenMint, 1000, 1); // Sell 1000 tokens with 1% slippage
-
-    // Example: Sell all tokens
-    // await bot.sellAll(tokenMint, 1);
+    const volumeTarget = 0.04; // Target volume in SOL (e.g., 1 SOL)
+    const perTransactionAmount = 0.01; // Amount per transaction in SOL (e.g., 0.1 SOL)
+    const slippage = 1; // Slippage tolerance percentage
+    const delayBetweenTrades = 2000; // Delay in milliseconds between trades
+    
+    // Run volume bot
+    await bot.generateVolume(
+      tokenMint,
+      volumeTarget,
+      perTransactionAmount,
+      slippage,
+      delayBetweenTrades
+    );
 
   } catch (error) {
     console.error('Bot error:', error);
